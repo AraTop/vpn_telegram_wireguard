@@ -1,3 +1,4 @@
+import asyncio
 import io
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
@@ -30,6 +31,8 @@ from zoneinfo import ZoneInfo
 wg_client = WGEasyClient(settings.wg_url, settings.wg_password)
 yk_client = YooKassaClient(settings.yk_shop_id, settings.yk_secret_key)
 
+BOT_BROADCAST_HEADER = "📣 Сообщение от VPN-сервиса\n\n"  # шапка, чтобы было видно «от бота»
+
 # ---------------------------
 # Small helpers (no stack)
 # ---------------------------
@@ -49,6 +52,9 @@ def _has_extra(u: User) -> bool:
         and u.extra_devices_until > datetime.now(timezone.utc)
         and (getattr(u, "extra_devices_count", 0) or 0) > 0
     )
+
+def safe_username(u):
+    return u.username if getattr(u, "username", None) else "—"
 
 import html
 
@@ -227,8 +233,163 @@ def _payments_kbd() -> InlineKeyboardMarkup:
             InlineKeyboardButton("📆 Год", callback_data="admin:payments:period:year"),
             InlineKeyboardButton("📅 Всё время", callback_data="admin:payments:period:all"),
         ],
-        [InlineKeyboardButton("⬅️ Назад", callback_data="menu:admin")],
+        [InlineKeyboardButton("⬅️ Назад", callback_data="admin:payments_list")],
     ])
+
+async def require_admin(update, session) -> bool:
+    me = (await session.execute(select(User).where(User.tg_id == update.effective_user.id))).scalar_one_or_none()
+    return bool(me and me.is_admin)
+
+async def get_user_by_id(session, uid: int) -> User | None:
+    return (await session.execute(select(User).where(User.id == uid))).scalar_one_or_none()
+
+async def build_user_card(uid: int, show_devices: bool):
+    async with async_session() as session:
+        u = await get_user_by_id(session, uid)
+        if not u:
+            return "Пользователь не найден.", InlineKeyboardMarkup([back_to_admin()])
+
+        now = datetime.now(timezone.utc)
+        total_quota = max(0, int(u.total_quota() or 0))
+
+        used = (await session.execute(
+            select(func.count(Device.id)).where(Device.user_id == u.id)
+        )).scalar_one() or 0
+
+        free = max(0, total_quota - int(used))
+
+        base_active  = bool(u.subscription_until and u.subscription_until > now)
+        extra_active = bool(u.extra_devices_until and u.extra_devices_until > now)
+        cnt = int(u.extra_devices_count or 0)
+
+        title = f"{(u.first_name or '').strip()} {(u.last_name or '').strip()}".strip() or "Пользователь"
+        handle = f"@{u.username}" if u.username else "—"
+
+        text = (
+            f"👤 *{title}*\n"
+            f"ID: `{u.tg_id}`  |  {handle}\n\n"
+            f"💳 *Подписка:* {'активна до ' + fmt_human(u.subscription_until) if base_active else 'не активна'}\n"
+            f"➕ *Доп. слоты:* "
+            f"{('активны до ' + fmt_human(u.extra_devices_until) + f' (x{cnt})') if extra_active and cnt>0 else 'нет'}\n\n"
+            f"🖥 *Устройства:* {used} использовано / {total_quota} всего • свободно: {free}\n"
+            f"📅 *Регистрация:* {fmt_human(getattr(u, 'created_at', None))}\n"
+        )
+
+        if show_devices:
+            devices = (await session.execute(
+                select(Device).where(Device.user_id == u.id).order_by(Device.created_at.desc()).limit(10)
+            )).scalars().all()
+            if devices:
+                lines = []
+                for d in devices:
+                    status = "✅" if d.enabled else "🚫"
+                    kind = "➕доп" if d.is_extra else "💳база"
+                    lines.append(f"• `{d.wg_client_name}` {status} • {kind} • {fmt_human(d.created_at)}")
+                text += "\n*Последние устройства:*\n" + "\n".join(lines)
+            else:
+                text += "\n*Последние устройства:* —"
+
+        s = "1" if show_devices else "0"
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("➕ +7",  callback_data=f"admin:card:add_days:{uid}:7:{s}"),
+             InlineKeyboardButton("➕ +30", callback_data=f"admin:card:add_days:{uid}:30:{s}"),
+             InlineKeyboardButton("➕ +90", callback_data=f"admin:card:add_days:{uid}:90:{s}"),
+             InlineKeyboardButton("➕ +365",callback_data=f"admin:card:add_days:{uid}:365:{s}")],
+            [InlineKeyboardButton("Квота 1", callback_data=f"admin:card:set_quota:{uid}:1:{s}"),
+             InlineKeyboardButton("2",       callback_data=f"admin:card:set_quota:{uid}:2:{s}"),
+             InlineKeyboardButton("3",       callback_data=f"admin:card:set_quota:{uid}:3:{s}"),
+             InlineKeyboardButton("5",       callback_data=f"admin:card:set_quota:{uid}:5:{s}")],
+            [InlineKeyboardButton("❌ Отключить подписку", callback_data=f"admin:card:deactivate:{uid}:{s}")],
+            [InlineKeyboardButton("➕ +1 доп", callback_data=f"admin:card:addons_inc:{uid}:{s}"),
+             InlineKeyboardButton("➖ −1",     callback_data=f"admin:card:addons_dec:{uid}:{s}")],
+            [InlineKeyboardButton("📆 +30 дней доп", callback_data=f"admin:card:addons_extend:{uid}:{s}"),
+             InlineKeyboardButton("🧹 Сбросить доп", callback_data=f"admin:card:addons_deact:{uid}:{s}")],
+            [InlineKeyboardButton("📋 Показать устройства" if s=="0" else "🔽 Скрыть устройства",
+                                  callback_data=f"admin:card:toggle_devices:{uid}:{s}")],
+            [InlineKeyboardButton("💬 Написать", url=f"tg://user?id={u.tg_id}")],
+            back_to_admin()
+        ])
+        return text, kb
+
+async def render_user_card_view(query, uid: int, show_devices: bool):
+    text, kb = await build_user_card(uid, show_devices)
+    await query.edit_message_text(text, reply_markup=kb)
+
+async def render_user_card_message(chat_id: int, u: User, update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text, kb = await build_user_card(u.id, show_devices=False)
+    await context.bot.send_message(chat_id=chat_id, text=text, reply_markup=kb)
+
+from telegram.constants import ParseMode
+
+async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.effective_message
+    text_in = (msg.text or "").strip()
+
+    # 1) ждём текст для рассылки?
+    if context.user_data.get("await_notify_text"):
+        if not text_in:
+            await msg.reply_text("Сообщение пустое. Отправьте текст уведомления.")
+            return
+
+        scope = context.user_data.get("notify_scope")
+        if not scope:
+            await msg.reply_text("Не выбрана аудитория. Откройте: 📣 Уведомления.")
+            context.user_data.pop("await_notify_text", None)
+            return
+
+        # Сохраняем текст и показываем предпросмотр
+        context.user_data["notify_text"] = text_in
+        scope_h = (
+            "активным пользователям" if scope == "active"
+            else "неактивным пользователям" if scope == "inactive"
+            else "всем пользователям"
+        )
+        preview = (
+            "👀 *Предпросмотр*\n\n"
+            f"Будет отправлено *{scope_h}*.\n\n"
+            f"{BOT_BROADCAST_HEADER}{text_in}"
+        )
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("✅ Отправить", callback_data="admin:notify:confirm:send")],
+            [InlineKeyboardButton("❌ Отмена",    callback_data="admin:notify:confirm:cancel")],
+            [InlineKeyboardButton("⬅️ Назад",     callback_data="admin:notify")]
+        ])
+        await msg.reply_text(preview, reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
+        return
+
+    # 2) иначе — строгий поиск пользователя (@username или ID)
+    if context.user_data.get("await_user_search_exact"):
+        if not text_in:
+            await msg.reply_text("Отправьте @username или ID.")
+            return
+
+        is_username = text_in.startswith("@")
+        is_id = text_in.isdigit()
+        if not (is_username or is_id):
+            await msg.reply_text("Нужно отправить *точный* @username (с @) или *числовой* ID.", parse_mode=ParseMode.MARKDOWN)
+            return
+
+        async with async_session() as session:
+            me = (await session.execute(select(User).where(User.tg_id == update.effective_user.id))).scalar_one_or_none()
+            if not me or not me.is_admin:
+                await msg.reply_text("❌ Недостаточно прав.")
+                return
+
+            if is_username:
+                term = text_in[1:].lower()
+                q = select(User).where(func.lower(User.username) == term).limit(1)
+            else:
+                q = select(User).where(User.tg_id == int(text_in)).limit(1)
+
+            u = (await session.execute(q)).scalar_one_or_none()
+
+        if not u:
+            await msg.reply_text("Пользователь не найден. Проверьте @username или ID.")
+            return
+
+        await render_user_card_message(update.effective_chat.id, u, update, context)
+        context.user_data["await_user_search_exact"] = False
+        return
 
 from typing import Optional, List, Tuple
 async def ensure_user(
@@ -365,18 +526,56 @@ def main_menu(user: User) -> InlineKeyboardMarkup:
     rows = [
         [InlineKeyboardButton("💰 Подписки", callback_data="menu:tariffs")],
         [InlineKeyboardButton("🖥 Мои устройства", callback_data="menu:devices")],
-        [InlineKeyboardButton("🔗 Реферальная программа", callback_data="menu:ref")]
+        [InlineKeyboardButton("🔗 Реферальная программа", callback_data="menu:ref")],
+        [InlineKeyboardButton("❓ Помощь", callback_data="menu:help")]
     ]
     if user.is_admin:
         rows.append([InlineKeyboardButton("⚙️ Админ-панель", callback_data="menu:admin")])
     return kb(rows)
 
+async def list_recipient_ids(session, scope: str) -> list[int]:
+    now = datetime.now(timezone.utc)
+    if scope == "all":
+        q = select(User.tg_id)
+    elif scope == "active":
+        q = select(User.tg_id).where(active_clause(now))
+    else:  # inactive
+        q = select(User.tg_id).where(~active_clause(now))
+    return [row[0] for row in (await session.execute(q)).all()]
+
+async def count_recipients(session, scope: str) -> int:
+    now = datetime.now(timezone.utc)
+    if scope == "all":
+        q = select(func.count(User.id))
+    elif scope == "active":
+        q = select(func.count(User.id)).where(active_clause(now))
+    elif scope == "inactive":
+        q = select(func.count(User.id)).where(~active_clause(now))
+    else:
+        return 0
+    return (await session.execute(q)).scalar_one()
+
+def active_clause(now):
+    return or_(
+        and_(User.subscription_until.is_not(None), User.subscription_until > now),
+        and_(User.extra_devices_until.is_not(None), User.extra_devices_until > now),
+    )
+
+def notify_scope_kb():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🟢 Активным",   callback_data="admin:notify:scope:active")],
+        [InlineKeyboardButton("⚪️ Неактивным", callback_data="admin:notify:scope:inactive")],
+        [InlineKeyboardButton("👥 Всем",       callback_data="admin:notify:scope:all")],
+        back_to_admin()
+    ])
+
 def admin_menu() -> InlineKeyboardMarkup:
     rows = [
         [InlineKeyboardButton("⚙️ Настройки", callback_data="admin:settings")],
+        [InlineKeyboardButton("📣 Уведомления", callback_data="admin:notify")],
         [InlineKeyboardButton("📊 Статистика", callback_data="admin:stats")],
-        [InlineKeyboardButton("👥 Пользователи", callback_data="admin:users")],
-        [InlineKeyboardButton("💳 Платежи", callback_data="admin:payments")],
+        [InlineKeyboardButton("👥 Пользователи", callback_data="admin:users_list")],
+        [InlineKeyboardButton("💳 Платежи", callback_data="admin:payments_list")],
         [InlineKeyboardButton("⬅️ Назад", callback_data="menu:main")],
     ]
     return kb(rows)
@@ -407,9 +606,9 @@ async def _render_main_menu(query_or_message, tg_user):
     # 3) Статусы
     sub_line = f"✅ Активна до {fmt_human(u.subscription_until)}" if _has_base(u) else "❌ Нет активной подписки"
     extra_line = (
-        f"💳 Платные слоты: {extra_q} (до {fmt_human(getattr(u, 'extra_devices_until', None))})"
+        f"💳 Платные устройства: {extra_q} (до {fmt_human(getattr(u, 'extra_devices_until', None))})"
         if extra_q > 0 else
-        "💳 Платные слоты: нет"
+        "💳 Платные устройства: нет"
     )
     devices_line = f"🖥 Устройства: {used}/{total_q}  ·  🆓 {base_q}  ·  💳 {extra_q}"
 
@@ -456,15 +655,6 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # рендер главного меню как раньше
     await _render_main_menu(update.effective_message, update.effective_user)
 
-async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.effective_message.reply_text(
-        "Команды:\n"
-        "/start — главное меню\n"
-        "/help — помощь\n"
-        "/admin — админка (для администраторов)",
-        reply_markup=kb([[InlineKeyboardButton("Открыть меню", callback_data="menu:main")]]),
-    )
-
 async def admin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     async with async_session() as session:
         res = await session.execute(select(User).where(User.tg_id == update.effective_user.id))
@@ -482,6 +672,144 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     data = query.data or ""
+
+    # ---- help ----
+    if data == "menu:help":
+        text = (
+            "❓ *Помощь*\n\n"
+            "Добро пожаловать в центр поддержки!\n\n"
+            "Здесь ты найдёшь:\n"
+            "• ответы на частые вопросы,\n"
+            "• инструкции по подключению и настройке,\n"
+            "• информацию о тарифах и устройствах.\n\n"
+            "Выбирай нужный раздел ниже и получай подсказки 👇"
+        )
+        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("📡 Как подключить VPN", callback_data="help:how")],
+            [InlineKeyboardButton("🧰 VPN не работает", callback_data="help:troubleshoot")],
+            [InlineKeyboardButton("📱 Устройства и лимиты", callback_data="help:devices")],
+            [InlineKeyboardButton("➕ Доп. устройства", callback_data="help:addons")],
+            [InlineKeyboardButton("💬 Чат поддержки", callback_data="help:support")],
+            [InlineKeyboardButton("⬅️ Назад", callback_data="menu:main")]
+        ]), parse_mode="Markdown")
+        return
+
+    if data == "help:how":
+        text = (
+            "📡 *Как подключить VPN*\n\n"
+            "1) 💰 *Оформи подписку* — выбери подходящий срок и оплати.\n\n"
+            "2) 🖥 *Зайди в «Мои устройства»* — открой раздел в боте.\n\n"
+            "3) ➕ *Нажми «Добавить устройство»* — бот создаст конфиг (1 конфиг = 1 устройство).\n"
+            "   • Если конфиг *пришёл сообщением* — просто скачай его.\n"
+            "   • Если конфиг *не пришёл автоматически* — открой созданное устройство и нажми:\n"
+            "     📥 *Скачать конфиг* — файл *.conf* для импорта\n"
+            "     🗑 *Удалить* — если устройство больше не нужно\n\n"
+            "4) ⚙️ *Установи WireGuard* на своё устройство (iOS/Android/Windows/macOS/Linux).\n\n"
+            "5) 📲 *Импортируй конфиг* в WireGuard:\n"
+            "   • через файл *.conf* (📥 Импорт из файла),\n"
+            "6) 🔌 *Включи туннель* в WireGuard — готово! Интернет пойдёт через VPN.\n\n"
+            "ℹ️ Подсказки:\n"
+            "• Подписка даёт базовый лимит устройств; доп. устройства покупаются отдельно.\n"
+            "• Нужно освободить слот? Удали лишний конфиг и создай новый.\n"
+            "• Что-то не работает — смотри раздел «🧰 VPN не работает»."
+        )
+        await query.edit_message_text(
+            text,
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("⬅️ Назад", callback_data="menu:help")]]
+            ),
+            parse_mode="Markdown"
+        )
+        return
+
+    if data == "help:troubleshoot":
+        text = (
+            "🧰 *VPN не работает*\n\n"
+            "Действуем по шагам — обычно этого достаточно:\n\n"
+            "1) 🔐 *Проверь подписку.* Если она не активна, доступ к VPN закрыт.\n"
+            "2) 📄 *Обнови конфиг.* Зайди в *🖥 Мои устройства* → выбери устройство → "
+            "нажми 📥 *Скачать конфиг* (или 🗑 *Удалить* и ➕ *Добавить устройство* заново).\n"
+            "3) 🔁 *Перезапусти VPN и устройство.* Выключи/включи профиль в приложении WireGuard, "
+            "затем перезагрузи телефон/компьютер.\n\n"
+            "🚫 *Не подключается*\n"
+            "• 🌍 Попробуй *другую сеть*: мобильный интернет вместо Wi-Fi или наоборот — "
+            "иногда сеть блокирует VPN.\n"
+            "• ⏱ Убедись, что на устройстве *включено авто-время и авто-часовой пояс* — "
+            "сбитые часы мешают соединению.\n"
+            "• 📴 Отключи другие VPN/прокси/блокировщики трафика, если они включены.\n\n"
+            "🐢 *Медленно или обрывы*\n"
+            "• Переключись между Wi-Fi и мобильной сетью, закрой тяжёлые загрузки и попробуй ещё раз.\n\n"
+            "Если проблема осталась — напиши нам в поддержку, мы быстро поможем 💬"
+        )
+        await query.edit_message_text(
+            text,
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("⬅️ Назад", callback_data="menu:help")]]
+            ),
+            parse_mode="Markdown"
+        )
+        return
+
+    if data == "help:devices":
+        text = (
+            "📱 *Устройства и лимиты*\n\n"
+            "• Лимит «включённых в подписку» устройств зависит от тарифа (1/2/3/5).\n"
+            "• Каждый конфиг = 1 устройство.\n"
+            "• Конфиги из подписки можно удалять и перевыпускать.\n"
+            "• Если *основная подписка заканчивается*, то *все устройства, выданные по подписке, удаляются*.\n"
+            "• *Доп. устройства* (купленные отдельно) при этом продолжают работать *до окончания их оплаченного срока*.\n"
+            "• Купить новые доп. устройства *нельзя*, если подписка не активна."
+        )
+        await query.edit_message_text(
+            text,
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("⬅️ Назад", callback_data="menu:help")]]
+            ),
+            parse_mode="Markdown"
+        )
+        return
+
+    if data == "help:addons":
+        text = (
+            "➕ *Доп. устройства*\n\n"
+            "• Стоимость: *100 ₽/мес* за 1 устройство.\n"
+            "• Купить можно *только при активной* основной подписке.\n"
+            "• Все доп. устройства синхронизированы по сроку: первая покупка задаёт «якорь»,\n"
+            "  и *все* последующие допы закончатся в *один день* — через ~1 месяц от якоря.\n"
+            "• Если основная подписка закончилась, уже купленные доп. устройства *продолжают работать*\n"
+            "  до конца своего оплаченного срока, затем *удаляются*.\n"
+            "• Пока подписка не активна, *докупать* доп. устройства нельзя."
+        )
+        await query.edit_message_text(
+            text,
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("⬅️ Назад", callback_data="menu:help")]]
+            ),
+            parse_mode="Markdown"
+        )
+        return
+
+    if data == "help:support":
+        handle = "@AraTop4k"
+        text = (
+            "💬 *Чат поддержки*\n\n"
+            "Нужна помощь или остались вопросы? Мы рядом и ответим максимально быстро.\n\n"
+            "👤 *Кому писать:* {handle}\n"
+            "✍️ *Что указать в первом сообщении:*\n"
+            "• ваш тариф (7/30/90/365)\n"
+            "• коротко проблему/вопрос\n"
+            "• при необходимости — скрин/ошибку\n\n"
+            "Нажмите кнопку ниже, чтобы открыть чат и написать нам прямо сейчас."
+        ).format(handle=handle)
+
+        await query.edit_message_text(
+            text,
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🗨️ Открыть чат", url="https://t.me/AraTop4k")],
+                [InlineKeyboardButton("⬅️ Назад", callback_data="menu:help")]
+            ])
+        )
+        return
 
     # ---- MAIN ----
     if data == "menu:main":
@@ -1001,10 +1329,274 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text("🛠 Админ-панель", reply_markup=admin_menu())
         return
 
+    if data == "admin:notify":
+        async with async_session() as session:
+            if not await require_admin(update, session):
+                await query.edit_message_text("❌ Недостаточно прав.", reply_markup=InlineKeyboardMarkup([back_to_admin()]))
+                return
+            # сброс состояния
+            context.user_data.pop("notify_scope", None)
+            context.user_data.pop("await_notify_text", None)
+            context.user_data.pop("notify_text", None)
+
+        text = (
+            "📣 Уведомления\n\n"
+            "Выберите аудиторию ниже."
+        )
+        await query.edit_message_text(text, reply_markup=notify_scope_kb())
+        return
+
+    # 2) Выбор аудитории
+    if data.startswith("admin:notify:scope:"):
+        scope = data.split(":")[3]  # active | inactive | all
+        async with async_session() as session:
+            if not await require_admin(update, session):
+                await query.answer("Нет прав", show_alert=True); return
+            n = await count_recipients(session, scope)
+
+        context.user_data["notify_scope"] = scope
+        context.user_data["await_notify_text"] = True
+        scope_h = "Активные" if scope == "active" else ("Неактивные" if scope == "inactive" else "Все пользователи")
+        text = (
+            "✍️ Текст уведомления\n\n"
+            f"Аудитория: {scope_h} (получателей: {n})\n\n"
+            "Отправьте сообщение одним текстом (Markdown разрешён). "
+            "Шапка «📣 Сообщение от VPN-сервиса» будет добавлена автоматически."
+        )
+        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Назад", callback_data="admin:notify")]]))
+        return
+
+    # 3) Подтверждение отправки (после предпросмотра)
+    if data.startswith("admin:notify:confirm:"):
+        # admin:notify:confirm:<send|cancel>
+        action = data.split(":")[3]
+        scope = context.user_data.get("notify_scope")
+        notify_text = context.user_data.get("notify_text")
+        if action == "cancel":
+            # сброс
+            context.user_data.pop("await_notify_text", None)
+            context.user_data.pop("notify_text", None)
+            text = "🚫 Отправка отменена."
+            await query.edit_message_text(text, reply_markup=notify_scope_kb())
+            return
+
+        if action == "send":
+            if not (scope and notify_text):
+                await query.answer("Нет данных для отправки.", show_alert=True); return
+
+            # берём список получателей и шлём
+            async with async_session() as session:
+                if not await require_admin(update, session):
+                    await query.answer("Нет прав", show_alert=True); return
+                ids = await list_recipient_ids(session, scope)
+
+            sent = 0
+            failed = 0
+            header = BOT_BROADCAST_HEADER
+            full_text = f"{header}{notify_text}"
+
+            # аккуратно шлём, уважая rate-limit
+            for tg_id in ids:
+                try:
+                    await context.bot.send_message(tg_id, full_text)
+                    sent += 1
+                except Exception:
+                    failed += 1
+                await asyncio.sleep(0.05)  # лёгкий троттлинг
+
+            # сброс состояния
+            context.user_data.pop("await_notify_text", None)
+            context.user_data.pop("notify_text", None)
+
+            result = (
+                "✅ *Рассылка завершена*\n\n"
+                f"Отправлено: *{sent}*\n"
+                f"Не доставлено: *{failed}*"
+            )
+            await query.edit_message_text(result, reply_markup=notify_scope_kb())
+            return
+
+    if data == "admin:users_list":
+        # кнопки действий
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🔍 Поиск пользователя", callback_data="admin:users")],
+            back_to_admin()
+        ])
+
+        await query.edit_message_text("👥 Пользователи", reply_markup=kb)
+        return
+
+    if data == "admin:users":
+        async with async_session() as session:
+            res = await session.execute(select(User).where(User.tg_id == update.effective_user.id))
+            user = res.scalar_one_or_none()
+            if not user or not user.is_admin:
+                await query.edit_message_text("❌ Недостаточно прав.", reply_markup=InlineKeyboardMarkup([back_to_main()]))
+                return
+
+        text = (
+            "👥 *Пользователи*\n\n"
+            "Отправьте *точный* `@username` (с @) *или* числовой *ID* пользователя.\n"
+            "Примеры: `@vasya` или `123456789`."
+        )
+        context.user_data["await_user_search_exact"] = True
+        await query.edit_message_text(
+            text
+        )
+        return
+
+    # открыть карточку профиля из любого места
+    if data.startswith("admin:user:"):
+        uid = int(data.split(":")[2])
+        async with async_session() as session:
+            if not await require_admin(update, session):
+                await query.edit_message_text("❌ Недостаточно прав.", reply_markup=InlineKeyboardMarkup([back_to_admin()]))
+                return
+        await render_user_card_view(query, uid, show_devices=False)
+        return
+
+    # показать/скрыть список устройств в самой карточке
+    if data.startswith("admin:card:toggle_devices:"):
+        _, _, _, uid, state = data.split(":")
+        await render_user_card_view(query, int(uid), show_devices=(state == "0"))
+        return
+
+    # продлить базовую подписку
+    if data.startswith("admin:card:add_days:"):
+        _, _, _, uid, days, state = data.split(":")
+        uid, days, show = int(uid), int(days), (state == "1")
+        async with async_session() as session:
+            if not await require_admin(update, session):
+                await query.answer("Нет прав", show_alert=True); return
+            u = await get_user_by_id(session, uid)
+            if not u:
+                await query.answer("Пользователь не найден", show_alert=True); return
+            from datetime import datetime, timedelta, timezone
+            now = datetime.now(timezone.utc)
+            start = u.subscription_until if (u.subscription_until and u.subscription_until > now) else now
+            u.subscription_until = start + timedelta(days=days)
+            await session.commit()
+        await render_user_card_view(query, uid, show_devices=show)
+        return
+
+    # установить квоту
+    if data.startswith("admin:card:set_quota:"):
+        _, _, _, uid, quota, state = data.split(":")
+        uid, quota, show = int(uid), int(quota), (state == "1")
+        async with async_session() as session:
+            if not await require_admin(update, session):
+                await query.answer("Нет прав", show_alert=True); return
+            u = await get_user_by_id(session, uid)
+            if not u:
+                await query.answer("Пользователь не найден", show_alert=True); return
+            u.device_quota = max(0, quota)
+            await session.commit()
+        await render_user_card_view(query, uid, show_devices=show)
+        return
+
+    # отключить базовую подписку
+    if data.startswith("admin:card:deactivate:"):
+        _, _, _, uid, state = data.split(":")
+        uid, show = int(uid), (state == "1")
+        async with async_session() as session:
+            if not await require_admin(update, session):
+                await query.answer("Нет прав", show_alert=True); return
+            u = await get_user_by_id(session, uid)
+            if not u:
+                await query.answer("Пользователь не найден", show_alert=True); return
+            u.subscription_until = None
+            u.device_quota = 0
+            await session.commit()
+        await render_user_card_view(query, uid, show_devices=show)
+        return
+
+    # +1 доп-слот (только при активной базе)
+    if data.startswith("admin:card:addons_inc:"):
+        _, _, _, uid, state = data.split(":")
+        uid, show = int(uid), (state == "1")
+        async with async_session() as session:
+            if not await require_admin(update, session):
+                await query.answer("Нет прав", show_alert=True); return
+            u = await get_user_by_id(session, uid)
+            if not u:
+                await query.answer("Пользователь не найден", show_alert=True); return
+            from datetime import datetime, timedelta, timezone
+            now = datetime.now(timezone.utc)
+            base_active = bool(u.subscription_until and u.subscription_until > now)
+            if not base_active:
+                await query.answer("База не активна — доп. слоты нельзя выдать.", show_alert=True)
+                await render_user_card_view(query, uid, show_devices=show)
+                return
+            u.extra_devices_count = max(0, int(u.extra_devices_count or 0) + 1)
+            if not (u.extra_devices_until and u.extra_devices_until > now):
+                u.extra_devices_until = now + timedelta(days=30)
+            await session.commit()
+        await render_user_card_view(query, uid, show_devices=show)
+        return
+
+    # -1 доп-слот
+    if data.startswith("admin:card:addons_dec:"):
+        _, _, _, uid, state = data.split(":")
+        uid, show = int(uid), (state == "1")
+        async with async_session() as session:
+            if not await require_admin(update, session):
+                await query.answer("Нет прав", show_alert=True); return
+            u = await get_user_by_id(session, uid)
+            if not u:
+                await query.answer("Пользователь не найден", show_alert=True); return
+            u.extra_devices_count = max(0, int(u.extra_devices_count or 0) - 1)
+            await session.commit()
+        await render_user_card_view(query, uid, show_devices=show)
+        return
+
+    # продлить доп-слоты на 30 дней
+    if data.startswith("admin:card:addons_extend:"):
+        _, _, _, uid, state = data.split(":")
+        uid, show = int(uid), (state == "1")
+        async with async_session() as session:
+            if not await require_admin(update, session):
+                await query.answer("Нет прав", show_alert=True); return
+            u = await get_user_by_id(session, uid)
+            if not u:
+                await query.answer("Пользователь не найден", show_alert=True); return
+            from datetime import datetime, timedelta, timezone
+            now = datetime.now(timezone.utc)
+            start = u.extra_devices_until if (u.extra_devices_until and u.extra_devices_until > now) else now
+            u.extra_devices_until = start + timedelta(days=30)
+            await session.commit()
+        await render_user_card_view(query, uid, show_devices=show)
+        return
+
+    # сбросить доп-слоты
+    if data.startswith("admin:card:addons_deact:"):
+        _, _, _, uid, state = data.split(":")
+        uid, show = int(uid), (state == "1")
+        async with async_session() as session:
+            if not await require_admin(update, session):
+                await query.answer("Нет прав", show_alert=True); return
+            u = await get_user_by_id(session, uid)
+            if not u:
+                await query.answer("Пользователь не найден", show_alert=True); return
+            u.extra_devices_count = 0
+            u.extra_devices_until = None
+            await session.commit()
+        await render_user_card_view(query, uid, show_devices=show)
+        return
+
     # Переключение периода
     if data.startswith("admin:payments:period:"):
         _, _, _, kind = data.split(":")  # today|month|year|all
         await _render_admin_payments(update.callback_query, update.effective_user.id, kind)
+        return
+
+    if data == "admin:payments_list":
+        # кнопки действий
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("💰 Статистика платежей", callback_data="admin:payments")],
+            back_to_admin()
+        ])
+
+        await query.edit_message_text("💳 Платежи", reply_markup=kb)
         return
 
     if data == "admin:payments":
@@ -1055,7 +1647,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         kb = InlineKeyboardMarkup([
             back_to_admin()
         ])
-        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup, parse_mode="Markdown")
+        await query.edit_message_text(text, reply_markup=kb, parse_mode="Markdown")
         return
 
     # catch-all
@@ -1131,9 +1723,9 @@ async def poll_pending_payments(context: ContextTypes.DEFAULT_TYPE):
 # ---------------------------
 # Registration
 # ---------------------------
-
+from telegram.ext import MessageHandler, filters
 def register_handlers(app: Application):
     app.add_handler(CommandHandler("start", start_cmd))
-    app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("admin", admin_cmd))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
     app.add_handler(CallbackQueryHandler(on_callback))
