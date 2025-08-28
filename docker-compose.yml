@@ -1,0 +1,50 @@
+services:
+  postgres:
+    image: postgres:16
+    container_name: vpn_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: vpn_bot
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+
+  wg-easy:
+    image: ghcr.io/wg-easy/wg-easy:latest
+    container_name: wg-easy
+    restart: unless-stopped
+    environment:
+      - WG_HOST=194.164.35.173
+      - PASSWORD_HASH=${WG_PASSWORD_HASH}
+      - WG_PORT=51820
+      - WG_DEFAULT_DNS=1.1.1.1,1.0.0.1
+      - WG_DEFAULT_ADDRESS=10.8.0.x
+    cap_add:
+      - NET_ADMIN
+      - SYS_MODULE
+    sysctls:
+      - net.ipv4.ip_forward=1
+      - net.ipv4.conf.all.src_valid_mark=1
+    volumes:
+      - wg-easy:/etc/wireguard
+    ports:
+      - "51820:51820/udp"
+      - "51821:51821/tcp"
+
+  bot:
+    build: .
+    container_name: vpn_bot_app
+    restart: unless-stopped
+    env_file: .env
+    depends_on:
+      - postgres
+      - wg-easy
+    # если хочешь видеть логи в реальном времени:
+    # command: ["python", "-u", "bot.py"]
+
+volumes:
+  pgdata:
+  wg-easy:
