@@ -30,7 +30,7 @@ from zoneinfo import ZoneInfo
 # === singletons ===
 wg_client = WGEasyClient(settings.wg_url, settings.wg_password)
 yk_client = YooKassaClient(settings.yk_shop_id, settings.yk_secret_key)
-
+user_payment_tasks = {}
 BOT_BROADCAST_HEADER = "📣 Сообщение от VPN-сервиса\n\n"  # шапка, чтобы было видно «от бота»
 
 # ---------------------------
@@ -57,6 +57,114 @@ def safe_username(u):
     return u.username if getattr(u, "username", None) else "—"
 
 import html
+
+# Функция отмены
+async def cancel_user_payment_check(user_id):
+    if user_id in user_payment_tasks:
+        user_payment_tasks[user_id].cancel()
+        try:
+            await user_payment_tasks[user_id]
+        except asyncio.CancelledError:
+            pass
+
+async def auto_check_payment(application, payment_id: str, user_id: int, yk_client):
+    start_time = asyncio.get_event_loop().time()
+    timeout = 600  # 10 минут в секундах
+    
+    print(f'🎯 Запуск проверки для payment {payment_id}, user {user_id}')
+    print(f'📊 Активные задачи: {list(user_payment_tasks.keys())}')
+
+    try:
+        while True:
+            # Проверяем таймаут
+            current_time = asyncio.get_event_loop().time()
+            if current_time - start_time > timeout:
+                # Время вышло, отменяем платеж
+                async with async_session() as session:
+                    p = (await session.execute(
+                        select(Payment).where(Payment.yk_payment_id == payment_id)
+                    )).scalar_one_or_none()
+                    
+                    # Отправляем сообщение пользователю
+                    try:
+                        await application.edit_message_text(
+                            "⏰ Время оплаты истекло. Платеж отменен.\n\n"
+                            "💡 Если вы хотели оплатить, создайте новый платеж.",
+                            reply_markup=InlineKeyboardMarkup([
+                                [InlineKeyboardButton("🏠 В меню", callback_data="menu:main")]
+                            ])
+                        )
+                    except Exception:
+                        pass
+                return
+
+            async with async_session() as session:
+                p = (await session.execute(
+                    select(Payment).where(Payment.yk_payment_id == payment_id)
+                )).scalar_one_or_none()
+
+                if not p:
+                    return  # Платёж удалён или не найден
+
+                try:
+                    info = await yk_client.get_payment(payment_id)
+                except Exception as e:
+                    print(f"⚠️ Ошибка получения статуса платежа {payment_id}: {e}")
+                    await asyncio.sleep(15)
+                    continue
+
+                status = info.get("status", "pending")
+                p.status = status
+                p.updated_at = datetime.now(timezone.utc)
+                
+                # Выводим время до автоотмены
+                time_left = int(timeout - (current_time - start_time))
+                print(f'🔄 Проверка платежа {payment_id}. До отмены: {time_left} сек.')
+                
+                if status == "succeeded":
+                    print('✅ Оплата прошла успешно')
+                    await _apply_successful_payment(session, p)
+                    await session.commit()
+
+                    try:
+                        await application.edit_message_text(
+                            "✅ Оплата прошла успешно!",
+                            reply_markup=InlineKeyboardMarkup([
+                                [InlineKeyboardButton("🏠 Открыть меню", callback_data="menu:main")]
+                            ])
+                        )
+                    except Exception:
+                        pass
+                    return
+
+                elif status == "canceled":
+                    print('❌ Оплата отменена.')
+                    await session.commit()
+                    try:
+                        await application.edit_message_text(
+                            "❌ Оплата отменена.",
+                            reply_markup=InlineKeyboardMarkup([
+                                [InlineKeyboardButton("🔄 Попробовать снова", callback_data="menu:tariffs")],
+                                [InlineKeyboardButton("🏠 В меню", callback_data="menu:main")]
+                            ])
+                        )
+                    except Exception:
+                        pass
+                    return
+
+            await asyncio.sleep(10)
+            
+    except asyncio.CancelledError:
+        # Задача была отменена вручную
+        print(f"⏹️ Проверка платежа {payment_id} отменена вручную")
+    except Exception as e:
+        print(f"❌ Критическая ошибка в auto_check_payment: {e}")
+    finally:
+        # Очищаем только если это текущая активная задача
+        if user_id in user_payment_tasks and user_payment_tasks[user_id] == asyncio.current_task():
+            del user_payment_tasks[user_id]
+            print(f"🧹 Задача для user {user_id} очищена")
+        print(f'📋 Осталось задач: {list(user_payment_tasks.keys())}')
 
 async def _render_admin_payments(query, tg_user_id: int, kind: str = "today"):
     # права
@@ -90,8 +198,7 @@ async def _render_admin_payments(query, tg_user_id: int, kind: str = "today"):
     # нормальные названия
     purpose_labels = {
         "TARIFF": "🧾 Подписки",
-        "EXTRA_DEVICE": "🧩 Доп. устройства",
-        "TOPUP": "💳 Пополнения",
+        "EXTRA_DEVICE": "🧩 Доп. устройства"
     }
 
     title = _payments_period_title(kind)
@@ -838,7 +945,6 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         _, _, sid = data.split(":")
         tariff_id = int(sid)
 
-        # 1) достаём тариф и пользователя
         async with async_session() as session:
             t = await session.get(Tariff, tariff_id)
             if not t or not t.is_active:
@@ -847,14 +953,13 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             u = (await session.execute(select(User).where(User.tg_id == update.effective_user.id))).scalar_one()
 
-            # 2) запрет повторной покупки, пока действующая подписка не кончилась
+            # Проверка активной подписки
             from datetime import datetime, timezone
             now = datetime.now(timezone.utc)
             if u.subscription_until and u.subscription_until > now:
-                until= fmt_human(u.subscription_until)
-                #until = u.subscription_until.astimezone(timezone.utc).strftime("%d-%m-%Y %H:%M")
+                until = fmt_human(u.subscription_until)
                 await query.edit_message_text(
-                    f"❌ У вас уже есть активная подписка до {until}. \n💰 Покупка новой подписки доступна после окончания текущей.",
+                    f"❌ У вас уже есть активная подписка до {until}.\n💰 Покупка новой подписки доступна после окончания текущей.",
                     reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Назад", callback_data="menu:tariffs")]]),
                 )
                 return
@@ -877,12 +982,12 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             confirmation_url = (pay.get("confirmation") or {}).get("confirmation_url")
             if not confirmation_url:
                 await query.edit_message_text(
-                    "Платёж создан, но платёжная ссылка не пришла. Попробуйте ещё раз позже.",
+                    "❌ Платёж создан, но платёжная ссылка не пришла. Попробуйте ещё раз позже.",
                     reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Назад", callback_data="menu:tariffs")], back_to_main()]),
                 )
                 return
 
-            # 4) пишем платёж в БД
+            # Создаем платеж в БД
             p = Payment(
                 yk_payment_id=pay["id"],
                 user_id=u.id,
@@ -896,60 +1001,66 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             session.add(p)
             await session.commit()
-            price = float(t.price)
-            rows = [
-                [InlineKeyboardButton("💳 Оплатить", url=confirmation_url)],
-            ]
-            if float(u.balance) >= price:
+
+            from datetime import datetime, timedelta
+            end_date = datetime.now() + timedelta(days=t.days)
+            formatted_date = end_date.strftime("%d.%m.%Y")
+            # Красивый чек-лист
+            check_list_text = f"""
+🎯 ДЕТАЛИ ВАШЕГО ЗАКАЗА
+
+✨ Тариф: {t.name}
+⏳ Срок действия: {t.days} дней (до {formatted_date})
+📱 Устройства: до {t.max_devices} шт.
+
+💎 Преимущества тарифа:
+• 🚀 Высокоскоростные VPN-серверы
+• 🛡️ 100% защита данных и анонимность
+• 📶 Стабильное соединение без разрывов
+• 🔒 Сквозное шифрование трафика
+• 🚫 Блокировка рекламы и трекеров
+• 🆘 Круглосуточная поддержка
+
+💰 Стоимость: {rub(t.price)}
+⏰ Счет действителен: 10 минут
+
+📝 Условия:
+• Оплата через безопасный шлюз
+• Мгновенная активация после оплаты
+
+После успешной оплаты подписка активируется автоматически 🎉
+
+💫 Спасибо, что выбираете нас!
+"""
+
+            # Кнопки
+            rows = []
+            rows.append([InlineKeyboardButton("💳 Оплатить картой", url=confirmation_url)])
+            
+            if float(u.balance) >= t.price:
                 rows.append([InlineKeyboardButton("💳 Оплатить балансом", callback_data=f"paybalance:TARIFF:{t.id}")])
+            
+            rows.append([InlineKeyboardButton("⬅️ К тарифам", callback_data="menu:tariffs")])
+            rows.append([InlineKeyboardButton("🏠 Главное меню", callback_data="menu:main")])
 
-            rows.append([InlineKeyboardButton("🔄 Проверить оплату", callback_data=f"paycheck:{pay['id']}")])
-            rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="menu:tariffs")])
-        # 5) показываем кнопки только после успешного создания платежа
-        await query.edit_message_text(
-            f"🧾 Счёт создан на {rub(t.price)}.\n💳 Нажмите кнопку для оплаты.",
-            reply_markup=InlineKeyboardMarkup(rows),
-        )
-        return
+            if u.id in user_payment_tasks:
+                old_task = user_payment_tasks[u.id]
+                old_task.cancel()  # Отменяем старую задачу
+                try:
+                    await old_task  # Ждем завершения
+                except asyncio.CancelledError:
+                    print(f"⏹️ Предыдущая задача для user {u.id} отменена")
+                except Exception as e:
+                    print(f"⚠️ Ошибка при отмене предыдущей задачи: {e}")
+            # Запускаем проверку платежа
+            user_payment_tasks[u.id] = asyncio.create_task(auto_check_payment(query, pay["id"], u.id, yk_client))
 
-    if data.startswith("paycheck:"):
-        _, payment_id = data.split(":")
-        async with async_session() as session:
-            p = (await session.execute(select(Payment).where(Payment.yk_payment_id == payment_id))).scalar_one_or_none()
-            if not p:
-                await query.edit_message_text("❌ Платёж не найден.", reply_markup=InlineKeyboardMarkup([back_to_main()]))
-                return
-
-            try:
-                info = await yk_client.get_payment(payment_id)
-            except Exception as e:
-                await query.edit_message_text(f"❌ Ошибка запроса статуса: {e}", reply_markup=InlineKeyboardMarkup([back_to_main()]))
-                return
-
-            status = info.get("status", "pending")
-            p.status = status
-            from datetime import datetime, timezone
-            p.updated_at = datetime.now(timezone.utc)
-
-            if status == "succeeded":
-                # применяем покупку
-                await _apply_successful_payment(session, p)
-                await session.commit()
-                await query.edit_message_text(
-                    "✅ Оплата прошла успешно ",
-                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Открыть меню", callback_data="menu:main")]]),
-                )
-                return
-
-            await session.commit()
-
-        # если ещё не подтвердилось
-        rows = [
-            [InlineKeyboardButton("🔄 Проверить ещё раз", callback_data=f"paycheck:{payment_id}")],
-            [InlineKeyboardButton("⬅️ Назад", callback_data="menu:devices")],
-        ]
-        await query.edit_message_text("❌ Платёж пока не подтверждён. Попробуйте позже.", reply_markup=InlineKeyboardMarkup(rows))
-        return
+            await query.edit_message_text(
+                check_list_text,
+                reply_markup=InlineKeyboardMarkup(rows),
+                parse_mode="Markdown"
+            )
+            return
 
     async def _render_devices_menu(query, user_id: int):
         # 1) Достаём пользователя и его устройства
@@ -1117,8 +1228,18 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if Decimal(u.balance) >= price:
                 rows.append([InlineKeyboardButton("💳 Оплатить балансом", callback_data="paybalance:EXTRA_DEVICE:-")])
 
+            if u.id in user_payment_tasks:
+                old_task = user_payment_tasks[u.id]
+                old_task.cancel()  # Отменяем старую задачу
+                try:
+                    await old_task  # Ждем завершения
+                except asyncio.CancelledError:
+                    print(f"⏹️ Предыдущая задача для user {u.id} отменена")
+                except Exception as e:
+                    print(f"⚠️ Ошибка при отмене предыдущей задачи: {e}")
+
             # Остальные кнопки
-            rows.append([InlineKeyboardButton("🔄 Проверить оплату", callback_data=f"paycheck:{p.yk_payment_id}")])
+            user_payment_tasks[u.id] = asyncio.create_task(auto_check_payment(query, pay["id"], u.id, yk_client))
             rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="menu:devices")])
             rows.append([InlineKeyboardButton("🏠 Меню", callback_data="menu:main")])
 
@@ -1126,8 +1247,9 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 (
                     "🔓 Дополнительных слотов нет.\n"
                     f"➕ Купите новый слот для 1 устройства за {rub(price)}.\n\n"
-                    "⏳ *Срок действия:* 30 дней.\n"
-                    "💡 *Важно:* все купленные доп-слоты имеют _общий_ срок действия. "
+                    "⏳ Срок действия: 30 дней.\n"
+                    "⏰ Счет действителен: 10 минут\n"
+                    "💡 Важно: все купленные доп-слоты имеют _общий_ срок действия. "
                     "Даже если вы купите несколько слотов в разные дни, они истекут одновременно — "
                     "по единой дате «платных слотов» в профиле.\n\n"
                     "⚠️ Если подписка закончится, устройства будут удалены, "
@@ -1255,6 +1377,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await session.commit()
 
                 # применяем право
+                await cancel_user_payment_check(u.id)
                 await _apply_successful_payment(session, p)
                 await session.commit()
 
@@ -1286,13 +1409,15 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
                 session.add(p)
                 await session.commit()
-
+                
+                # В обработчике оплаты балансом
+                await cancel_user_payment_check(u.id)
                 await _apply_successful_payment(session, p)
                 await session.commit()
 
                 await query.edit_message_text(
                     "✅ Доп. слот активирован (оплачено балансом)",
-                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("К устройствам", callback_data="menu:devices")]])
+                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🖥 К устройствам", callback_data="menu:devices")]])
                 )
                 return
     # ---- REF ----
