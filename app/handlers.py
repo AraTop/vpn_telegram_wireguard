@@ -16,12 +16,12 @@ from telegram.ext import (
     CallbackQueryHandler,
     Application,
 )
-from sqlalchemy import select, func, and_, or_
+from sqlalchemy import asc, select, func, and_, or_
 from sqlalchemy.ext.asyncio import AsyncSession
 from app.config import settings
 from app.database import async_session
 import app.models as M
-from app.models import User, Tariff, Device, Payment
+from app.models import Node, User, Tariff, Device, Payment
 from app.utils import rub, gen_ref_code
 from app.wg_api import WGEasyClient
 from app.payments import YooKassaClient
@@ -36,6 +36,19 @@ BOT_BROADCAST_HEADER = "📣 Сообщение от VPN-сервиса\n\n"  # 
 # ---------------------------
 # Small helpers (no stack)
 # ---------------------------
+
+async def pick_best_node(session: AsyncSession) -> M.Node | None:
+    result = await session.execute(
+        select(M.Node)
+        .where(
+            and_(
+                M.Node.is_active == True,
+                M.Node.load < M.Node.max_capacity  # <-- проверка лимита
+            )
+        )
+        .order_by(asc(M.Node.load))
+    )
+    return result.scalars().first()
 
 def _extra_active(u: M.User) -> bool:
     return bool(u.extra_devices_until and u.extra_devices_until > datetime.now(timezone.utc))
@@ -1151,16 +1164,23 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             # Решаем, куда будет относиться новое устройство
             if base_count < base_quota:
                 # создаём базовое устройство
+                node = await pick_best_node(session)
+                if not node:
+                    await context.bot.send_message(chat_id=update.effective_chat.id, text="⚠️ Нет доступных серверов для создания устройства. \n Обратитесь в поддержку")
+                    return
+
                 name = f"user{u.id}-{base_count+1}"
                 peer = await wg_client.create_client(name=name)
 
                 d = M.Device(
                     user_id=u.id,
-                    wg_client_id=str(peer.get("id") or peer.get("clientId") or peer.get("_id")),
-                    wg_client_name=peer.get("name", name),
+                    wg_client_id=peer.get("id"),
+                    wg_client_name=name,
                     is_extra=False,
+                    node_id=node.id
                 )
                 session.add(d)
+                node.load += 1
                 await session.commit()
 
                 # отсылаем конфиг
@@ -1170,7 +1190,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     bio.name = f"{d.wg_client_name}.conf"
                     await context.bot.send_document(chat_id=update.effective_chat.id, document=InputFile(bio))
                 except Exception:
-                    await context.bot.send_message(chat_id=update.effective_chat.id, text="Устройство создано, но конфиг не получен. Откройте WG-Easy UI.")
+                    await context.bot.send_message(chat_id=update.effective_chat.id, text="⚠️ Устройство создано, но конфиг не получен. Откройте WG-Easy UI.")
 
                 await _render_devices_menu(query, update.effective_user.id)
                 return
@@ -1196,7 +1216,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     bio.name = f"{d.wg_client_name}.conf"
                     await context.bot.send_document(chat_id=update.effective_chat.id, document=InputFile(bio))
                 except Exception:
-                    await context.bot.send_message(chat_id=update.effective_chat.id, text="Устройство создано, но конфиг не получен. Откройте WG-Easy UI.")
+                    await context.bot.send_message(chat_id=update.effective_chat.id, text="⚠️ Устройство создано, но конфиг не получен. Откройте WG-Easy UI.")
 
                 await _render_devices_menu(query, update.effective_user.id)
                 return
@@ -1313,28 +1333,50 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.answer()
         except Exception:
             pass
+
         _, _, sid = data.split(":")
         dev_id = int(sid)
+
         async with async_session() as session:
             d = await session.get(M.Device, dev_id)
             if not d:
-                await query.edit_message_text("❌ Устройство не найдено.", reply_markup=InlineKeyboardMarkup([back_to_main()]))
+                await query.edit_message_text(
+                    "❌ Устройство не найдено.",
+                    reply_markup=InlineKeyboardMarkup([back_to_main()])
+                )
                 return
-            if d.wg_client_id:
+
+            # Берем ноду устройства
+            if d.node_id:
+                node = await session.get(M.Node, d.node_id)
+            else:
+                node = None
+
+            if d.wg_client_id and node:
                 try:
-                    await wg_client.delete_client(d.wg_client_id)
+                    node_client = WGEasyClient(node.api_url, node.api_password)
+                    await node_client.delete_client(d.wg_client_id)
+
+                    # уменьшаем нагрузку на сервер
+                    node.load = max(0, node.load - 1)
                 except Exception as e:
-                    await query.edit_message_text(f"WG API ошибка: {e}", reply_markup=InlineKeyboardMarkup([back_to_main()]))
+                    await query.edit_message_text(
+                        f"WG API ошибка при удалении: {e}",
+                        reply_markup=InlineKeyboardMarkup([back_to_main()])
+                    )
                     return
+
             await session.delete(d)
             await session.commit()
 
         await query.edit_message_text(
             "✅ Устройство удалено.",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🖥 К устройствам", callback_data="menu:devices")], back_to_main()]),
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🖥 К устройствам", callback_data="menu:devices")],
+                back_to_main()
+            ]),
         )
         return
-
     # ---- PAY BY BALANCE ----
     if data.startswith("paybalance:"):
         # форматы: paybalance:TARIFF:<tariff_id>  или  paybalance:EXTRA_DEVICE:-

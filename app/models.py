@@ -80,7 +80,7 @@ class Device(Base):
 
     # новое поле: это «доп» устройство (идёт из доп-квоты)?
     is_extra: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
-
+    node_id: Mapped[int] = mapped_column(ForeignKey("nodes.id", ondelete="SET NULL"))
     enabled: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=datetime.utcnow)
 
@@ -102,3 +102,14 @@ class Payment(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=datetime.utcnow, onupdate=datetime.utcnow)
 
     user: Mapped[User] = relationship(back_populates="payments")
+
+class Node(Base):
+    __tablename__ = "nodes"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    name: Mapped[str] = mapped_column(String(100), unique=True)  # название сервера
+    api_url: Mapped[str] = mapped_column(String(255))  # URL WG-Easy API
+    api_password: Mapped[str] = mapped_column(String(255))  # пароль для API
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True)  # активен ли сервер
+    load: Mapped[int] = mapped_column(Integer, default=0)  # сколько устройств на сервере
+    max_capacity: Mapped[int] = mapped_column(Integer, default=100)  # максимум клиентов
