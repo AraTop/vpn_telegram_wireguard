@@ -1353,10 +1353,9 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 node = None
 
             if d.wg_client_id and node:
+                node_client = WGEasyClient(node.api_url, node.api_password)
                 try:
-                    node_client = WGEasyClient(node.api_url, node.api_password)
                     await node_client.delete_client(d.wg_client_id)
-
                     # уменьшаем нагрузку на сервер
                     node.load = max(0, node.load - 1)
                 except Exception as e:
@@ -1365,6 +1364,9 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         reply_markup=InlineKeyboardMarkup([back_to_main()])
                     )
                     return
+                finally:
+                    # обязательно закрываем сессию
+                    await node_client.close()
 
             await session.delete(d)
             await session.commit()
