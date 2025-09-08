@@ -771,6 +771,8 @@ async def _render_main_menu(query_or_message, tg_user):
         await query_or_message.reply_text(text, reply_markup=kbd)
 
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.clear()
+    
     ref = None
     if context.args and len(context.args) == 1:
         ref = context.args[0]
