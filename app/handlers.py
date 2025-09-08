@@ -182,9 +182,14 @@ async def auto_check_payment(application, payment_id: str, user_id: int, yk_clie
 async def _render_admin_payments(query, tg_user_id: int, kind: str = "today"):
     # права
     async with async_session() as session:
-        admin = (await session.execute(select(User).where(User.tg_id == tg_user_id))).scalar_one_or_none()
+        admin = (await session.execute(
+            select(User).where(User.tg_id == tg_user_id))
+        ).scalar_one_or_none()
         if not admin or not admin.is_admin:
-            await query.edit_message_text("❌ Недостаточно прав.", reply_markup=InlineKeyboardMarkup([back_to_admin()]))
+            await query.edit_message_text(
+                "❌ Недостаточно прав.",
+                reply_markup=InlineKeyboardMarkup([back_to_admin()])
+            )
             return
 
         start, end = _period_bounds(kind)
@@ -200,6 +205,14 @@ async def _render_admin_payments(query, tg_user_id: int, kind: str = "today"):
             select(func.coalesce(func.sum(Payment.amount), 0)).where(and_(*conds))
         )).scalar_one()
 
+        # Разделяем YooKassa и Баланс
+        external_sum = (await session.execute(
+            select(func.coalesce(func.sum(Payment.amount), 0))
+            .where(and_(*conds, Payment.yk_payment_id.isnot(None)))
+        )).scalar_one()
+
+        balance_sum = float(total_sum) - float(external_sum)
+
         breakdown = (await session.execute(
             select(Payment.purpose,
                    func.count(Payment.id),
@@ -208,10 +221,10 @@ async def _render_admin_payments(query, tg_user_id: int, kind: str = "today"):
             .group_by(Payment.purpose)
         )).all()
 
-    # нормальные названия
     purpose_labels = {
         "TARIFF": "🧾 Подписки",
-        "EXTRA_DEVICE": "🧩 Доп. устройства"
+        "EXTRA_DEVICE": "🧩 Доп. устройства",
+        "TOPUP": "💰 Пополнения"
     }
 
     title = _payments_period_title(kind)
@@ -221,6 +234,8 @@ async def _render_admin_payments(query, tg_user_id: int, kind: str = "today"):
         "",
         f"Всего покупок: <b>{int(total_count)}</b>",
         f"На сумму: <b>{float(total_sum):.2f} ₽</b>",
+        f"— С YooKassa: <b>{float(external_sum):.2f} ₽</b>",
+        f"— С баланса: <b>{float(balance_sum):.2f} ₽</b>",
     ]
     if breakdown:
         lines.append("")
@@ -229,7 +244,12 @@ async def _render_admin_payments(query, tg_user_id: int, kind: str = "today"):
             label = purpose_labels.get(purpose, f"• {purpose}")
             lines.append(f"{label}: <b>{int(cnt)}</b> шт. / <b>{float(summ):.2f} ₽</b>")
 
-    await query.edit_message_text("\n".join(lines), reply_markup=_payments_kbd(), parse_mode="HTML")
+    await query.edit_message_text(
+        "\n".join(lines),
+        reply_markup=_payments_kbd(),
+        parse_mode="HTML"
+    )
+
 
 def _has_base(u: User) -> bool:
     return bool(u.subscription_until and u.subscription_until > datetime.now(timezone.utc))
