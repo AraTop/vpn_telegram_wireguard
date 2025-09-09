@@ -744,7 +744,7 @@ async def _render_main_menu(query_or_message, tg_user):
     total_q = max(0, base_q + extra_q)
 
     # 3) Статусы
-    sub_line = f"✅ Активна до {fmt_human(u.subscription_until)}" if _has_base(u) else "❌ Нет активной подписки"
+    sub_line = f"✅ Активна (до {fmt_human(u.subscription_until)})" if _has_base(u) else "❌ Нет активной подписки"
     extra_line = (
         f"💳 Платные устройства: {extra_q} (до {fmt_human(getattr(u, 'extra_devices_until', None))})"
         if extra_q > 0 else
