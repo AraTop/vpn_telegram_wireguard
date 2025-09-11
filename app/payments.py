@@ -30,15 +30,40 @@ class YooKassaClient:
                     raise YooKassaError(f"{resp.status}: {data}")
                 return data
 
-    async def create_payment(self, amount: float, currency: str, description: str, return_url: str, metadata: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    async def create_payment(self, amount: float, currency: str, description: str, return_url: str, metadata: Optional[Dict[str, Any]] = None ) -> Dict[str, Any]:
         idem = str(uuid.uuid4())
+
         payload = {
-            "amount": {"value": f"{amount:.2f}", "currency": currency},
-            "confirmation": {"type": "redirect", "return_url": return_url},
+            "amount": {
+                "value": f"{amount:.2f}",
+                "currency": currency
+            },
+            "confirmation": {
+                "type": "redirect",
+                "return_url": return_url
+            },
             "capture": True,
             "description": description,
             "metadata": metadata or {},
+            "receipt": {
+                "customer": {
+                    # Подставляем tg_id если есть, иначе "anonymous"
+                    "email": f"user{metadata.get('tg_id', 'anonymous')}@vpn.local"
+                },
+                "items": [
+                    {
+                        "description": description[:128],  # max 128 символов
+                        "quantity": "1.00",
+                        "amount": {
+                            "value": f"{amount:.2f}",
+                            "currency": currency
+                        },
+                        "vat_code": 1  # 1 = без НДС
+                    }
+                ]
+            }
         }
+
         data = await self._request("POST", "/payments", json=payload, idempotence_key=idem)
         return data
 
